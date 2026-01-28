@@ -19,12 +19,24 @@ def build_model(config):
     return model_module.GPT(config)
 
 
-def encode_prompt(prompt: str) -> list[int]:
-    return list(prompt.encode("utf-8"))
+def get_tokenizer(tokenizer_name: str | None):
+    if not tokenizer_name:
+        return None
+    import tiktoken
+
+    return tiktoken.get_encoding(tokenizer_name)
 
 
-def decode_tokens(tokens: list[int]) -> str:
-    return bytes(tokens).decode("utf-8", errors="replace")
+def encode_prompt(prompt: str, tokenizer=None) -> list[int]:
+    if tokenizer is None:
+        return list(prompt.encode("utf-8"))
+    return tokenizer.encode(prompt)
+
+
+def decode_tokens(tokens: list[int], tokenizer=None) -> str:
+    if tokenizer is None:
+        return bytes(tokens).decode("utf-8", errors="replace")
+    return tokenizer.decode(tokens)
 
 
 def generate(model, idx, max_new_tokens, temperature=1.0, top_k=None):
@@ -54,7 +66,8 @@ def load_checkpoint(path, device):
     model = build_model(config)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
-    return model
+    tokenizer_info = checkpoint.get("tokenizer", {})
+    return model, tokenizer_info
 
 
 def main():
@@ -64,14 +77,22 @@ def main():
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=os.path.join(ROOT_DIR, "weights", "min_ckpt.pt"),
+    )
+    parser.add_argument("--tokenizer", type=str, default=None)
     args = parser.parse_args()
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    ckpt_path = os.path.join(ROOT_DIR, "weights", "min_ckpt.pt")
-    model = load_checkpoint(ckpt_path, device)
+    model, tokenizer_info = load_checkpoint(args.checkpoint, device)
+
+    tokenizer_name = args.tokenizer or tokenizer_info.get("name")
+    tokenizer = get_tokenizer(tokenizer_name)
 
     prompt = args.prompt
-    token_ids = encode_prompt(prompt)
+    token_ids = encode_prompt(prompt, tokenizer=tokenizer)
     if not token_ids:
         token_ids = [0]
     idx = torch.tensor([token_ids], dtype=torch.long, device=device)
@@ -83,7 +104,7 @@ def main():
         temperature=args.temperature,
         top_k=args.top_k,
     )
-    output_text = decode_tokens(out[0].tolist())
+    output_text = decode_tokens(out[0].tolist(), tokenizer=tokenizer)
     print(output_text)
 
 
