@@ -15,6 +15,23 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
+if hasattr(nn, "RMSNorm"):
+    RMSNorm = nn.RMSNorm
+else:
+
+    class RMSNorm(nn.Module):
+        """RMSNorm (no bias), following the standard formulation."""
+
+        def __init__(self, n_embd: int, eps: float = 1e-6) -> None:
+            super().__init__()
+            self.eps = eps
+            self.weight = nn.Parameter(torch.ones(n_embd))
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            rms = torch.mean(x**2, dim=-1, keepdim=True)
+            x = x * torch.rsqrt(rms + self.eps)
+            return x * self.weight
+
 
 @dataclass
 class GPTConfig:
@@ -102,13 +119,17 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    """Feed-forward network (MLP) with GELU."""
+    """Feed-forward network (SwiGLU) with SiLU gating."""
 
     def __init__(self, n_embd: int, dropout: float) -> None:
         super().__init__()
-        self.fc1 = nn.Linear(n_embd, 4 * n_embd)
-        self.act = nn.GELU()
-        self.fc2 = nn.Linear(4 * n_embd, n_embd)
+        hidden_dim = int(4 * n_embd * 2 / 3)
+        if hidden_dim % 2 != 0:
+            hidden_dim += 1
+        self.w_gate = nn.Linear(n_embd, hidden_dim)
+        self.w_up = nn.Linear(n_embd, hidden_dim)
+        self.act = nn.SiLU()
+        self.w_down = nn.Linear(hidden_dim, n_embd)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -120,9 +141,10 @@ class MLP(nn.Module):
         Returns:
             (B, T, C)
         """
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.fc2(x)
+        gate = self.act(self.w_gate(x))
+        up = self.w_up(x)
+        hidden = gate * up
+        x = self.w_down(hidden)
         return self.dropout(x)
 
 
@@ -131,9 +153,9 @@ class TransformerBlock(nn.Module):
 
     def __init__(self, n_head: int, n_embd: int, block_size: int, dropout: float) -> None:
         super().__init__()
-        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln1 = RMSNorm(n_embd, eps=1e-6)
         self.attn = CausalSelfAttention(n_head, n_embd, block_size, dropout)
-        self.ln2 = nn.LayerNorm(n_embd)
+        self.ln2 = RMSNorm(n_embd, eps=1e-6)
         self.mlp = MLP(n_embd, dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -175,7 +197,7 @@ class GPT(nn.Module):
                 for _ in range(config.n_layer)
             ]
         )
-        self.ln_f = nn.LayerNorm(config.n_embd)
+        self.ln_f = RMSNorm(config.n_embd, eps=1e-6)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
         self.apply(self._init_weights)
