@@ -147,6 +147,7 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     """Feed-forward network (MoE with SwiGLU experts)."""
+    """Feed-forward network (SwiGLU) with SiLU gating."""
 
     def __init__(self, n_embd: int, dropout: float, num_experts: int = 4) -> None:
         super().__init__()
