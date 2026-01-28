@@ -28,6 +28,7 @@ else:
             self.weight = nn.Parameter(torch.ones(n_embd))
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
+            # Normalize by root-mean-square; no mean subtraction and no bias term.
             rms = torch.mean(x**2, dim=-1, keepdim=True)
             x = x * torch.rsqrt(rms + self.eps)
             return x * self.weight
@@ -86,7 +87,7 @@ class CausalSelfAttention(nn.Module):
         self.attn_dropout = nn.Dropout(dropout)
         self.resid_dropout = nn.Dropout(dropout)
 
-        # Causal mask (1, 1, T, T)
+        # Causal mask (1, 1, T, T) to prevent attending to future tokens.
         mask = torch.tril(torch.ones(block_size, block_size))
         self.register_buffer("causal_mask", mask.view(1, 1, block_size, block_size))
 
@@ -130,14 +131,14 @@ class CausalSelfAttention(nn.Module):
         q = self._apply_rope(q, cos, sin)
         k = self._apply_rope(k, cos, sin)
 
-        # Scaled dot-product attention
+        # Scaled dot-product attention (RoPE already applied to q/k).
         attn_scores = (q @ k.transpose(-2, -1)) / (self.head_dim**0.5)
         causal_mask = self.causal_mask[:, :, :seq_len, :seq_len]
         attn_scores = attn_scores.masked_fill(causal_mask == 0, float("-inf"))
         attn_weights = torch.softmax(attn_scores, dim=-1)
         attn_weights = self.attn_dropout(attn_weights)
 
-        # (B, n_head, T, head_dim) -> (B, T, C)
+        # (B, n_head, T, head_dim) -> (B, T, C) merge heads.
         attn_output = attn_weights @ v
         attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, n_embd)
         attn_output = self.out_proj(attn_output)
@@ -190,6 +191,7 @@ class MLP(nn.Module):
         Returns:
             (B, T, C)
         """
+        # Router logits per token; top-2 routing keeps compute bounded.
         logits = self.router(x)  # (B, T, N)
         topk_vals, topk_idx = torch.topk(logits, k=2, dim=-1)
         topk_weights = torch.softmax(topk_vals, dim=-1)  # (B, T, 2)
@@ -204,7 +206,7 @@ class MLP(nn.Module):
         for idx, expert_out in enumerate(expert_outputs):
             mixed = mixed + expert_out * weights[..., idx : idx + 1]
 
-        # Cache selection statistics for optional load monitoring.
+        # Cache selection statistics for optional load monitoring (no aux loss here).
         with torch.no_grad():
             token_counts = weights.gt(0).sum(dim=(0, 1))
             total_tokens = weights.shape[0] * weights.shape[1]
