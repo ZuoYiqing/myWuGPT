@@ -19,12 +19,24 @@ def build_model(config):
     return model_module.GPT(config)
 
 
-def encode_prompt(prompt: str) -> list[int]:
-    return list(prompt.encode("utf-8"))
-
-
-def decode_tokens(tokens: list[int]) -> str:
-    return bytes(tokens).decode("utf-8", errors="replace")
+def get_tokenizer(tokenizer_info: dict | None):
+    if not tokenizer_info:
+        return (
+            lambda prompt: list(prompt.encode("utf-8")),
+            lambda tokens: bytes(tokens).decode("utf-8", errors="replace"),
+        )
+    try:
+        import tiktoken
+    except ImportError as exc:
+        raise RuntimeError(
+            "tiktoken is required to use this checkpoint. Install with `pip install tiktoken`."
+        ) from exc
+    encoding_name = tokenizer_info.get("encoding", "gpt2")
+    encoding = tiktoken.get_encoding(encoding_name)
+    return (
+        lambda prompt: encoding.encode(prompt),
+        lambda tokens: encoding.decode(tokens),
+    )
 
 
 def generate(model, idx, max_new_tokens, temperature=1.0, top_k=None):
@@ -54,7 +66,8 @@ def load_checkpoint(path, device):
     model = build_model(config)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
-    return model
+    tokenizer_info = checkpoint.get("tokenizer")
+    return model, tokenizer_info
 
 
 def main():
@@ -64,11 +77,17 @@ def main():
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=os.path.join(ROOT_DIR, "weights", "min_ckpt.pt"),
+        help="Path to checkpoint",
+    )
     args = parser.parse_args()
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    ckpt_path = os.path.join(ROOT_DIR, "weights", "min_ckpt.pt")
-    model = load_checkpoint(ckpt_path, device)
+    model, tokenizer_info = load_checkpoint(args.checkpoint, device)
+    encode_prompt, decode_tokens = get_tokenizer(tokenizer_info)
 
     prompt = args.prompt
     token_ids = encode_prompt(prompt)
