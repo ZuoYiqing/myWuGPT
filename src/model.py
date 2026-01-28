@@ -28,6 +28,7 @@ else:
             self.weight = nn.Parameter(torch.ones(n_embd))
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
+            # Normalize by root-mean-square; no mean subtraction and no bias term.
             rms = torch.mean(x**2, dim=-1, keepdim=True)
             x = x * torch.rsqrt(rms + self.eps)
             return x * self.weight
@@ -76,6 +77,9 @@ class CausalSelfAttention(nn.Module):
         self.n_head = n_head
         self.head_dim = n_embd // n_head
         self.block_size = block_size
+        # RoPE requires even head_dim to rotate pairs of channels.
+        if self.head_dim % 2 != 0:
+            raise ValueError("head_dim must be even for RoPE")
 
         # Projection for query, key, value
         self.qkv_proj = nn.Linear(n_embd, 3 * n_embd)
@@ -83,9 +87,26 @@ class CausalSelfAttention(nn.Module):
         self.attn_dropout = nn.Dropout(dropout)
         self.resid_dropout = nn.Dropout(dropout)
 
-        # Causal mask (1, 1, T, T)
+        # Causal mask (1, 1, T, T) to prevent attending to future tokens.
         mask = torch.tril(torch.ones(block_size, block_size))
         self.register_buffer("causal_mask", mask.view(1, 1, block_size, block_size))
+
+        # Precompute RoPE tables (cos/sin) up to block_size; buffers are non-trainable.
+        inv_freq = 1.0 / (
+            10000 ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim)
+        )
+        positions = torch.arange(block_size, dtype=torch.float32)
+        freqs = torch.einsum("i,j->ij", positions, inv_freq)
+        self.register_buffer("rope_cos", freqs.cos())
+        self.register_buffer("rope_sin", freqs.sin())
+
+    def _apply_rope(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        # Rotate even/odd feature pairs as in the RoPE formulation.
+        x_even = x[..., ::2]
+        x_odd = x[..., 1::2]
+        x_rotated_even = x_even * cos - x_odd * sin
+        x_rotated_odd = x_even * sin + x_odd * cos
+        return torch.stack((x_rotated_even, x_rotated_odd), dim=-1).flatten(-2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass.
@@ -104,14 +125,20 @@ class CausalSelfAttention(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # each: (B, n_head, T, head_dim)
 
-        # Scaled dot-product attention
+        # Slice RoPE tables to sequence length and broadcast over batch/head dims.
+        cos = self.rope_cos[:seq_len].view(1, 1, seq_len, -1)
+        sin = self.rope_sin[:seq_len].view(1, 1, seq_len, -1)
+        q = self._apply_rope(q, cos, sin)
+        k = self._apply_rope(k, cos, sin)
+
+        # Scaled dot-product attention (RoPE already applied to q/k).
         attn_scores = (q @ k.transpose(-2, -1)) / (self.head_dim**0.5)
         causal_mask = self.causal_mask[:, :, :seq_len, :seq_len]
         attn_scores = attn_scores.masked_fill(causal_mask == 0, float("-inf"))
         attn_weights = torch.softmax(attn_scores, dim=-1)
         attn_weights = self.attn_dropout(attn_weights)
 
-        # (B, n_head, T, head_dim) -> (B, T, C)
+        # (B, n_head, T, head_dim) -> (B, T, C) merge heads.
         attn_output = attn_weights @ v
         attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, n_embd)
         attn_output = self.out_proj(attn_output)
@@ -119,18 +146,42 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
+    """Feed-forward network (MoE with SwiGLU experts)."""
     """Feed-forward network (SwiGLU) with SiLU gating."""
 
-    def __init__(self, n_embd: int, dropout: float) -> None:
+    def __init__(self, n_embd: int, dropout: float, num_experts: int = 4) -> None:
         super().__init__()
+        # Expert hidden size follows the SwiGLU recommendation and is rounded to even.
         hidden_dim = int(4 * n_embd * 2 / 3)
         if hidden_dim % 2 != 0:
             hidden_dim += 1
-        self.w_gate = nn.Linear(n_embd, hidden_dim)
-        self.w_up = nn.Linear(n_embd, hidden_dim)
-        self.act = nn.SiLU()
-        self.w_down = nn.Linear(hidden_dim, n_embd)
-        self.dropout = nn.Dropout(dropout)
+
+        class SwiGLUExpert(nn.Module):
+            """Single SwiGLU expert: SiLU(gate) * up -> down, dropout after down."""
+
+            def __init__(self, embd: int, hid: int, drop: float) -> None:
+                super().__init__()
+                self.w_gate = nn.Linear(embd, hid)
+                self.w_up = nn.Linear(embd, hid)
+                self.act = nn.SiLU()
+                self.w_down = nn.Linear(hid, embd)
+                self.dropout = nn.Dropout(drop)
+
+            def forward(self, x_in: torch.Tensor) -> torch.Tensor:
+                gate = self.act(self.w_gate(x_in))
+                up = self.w_up(x_in)
+                hidden = gate * up
+                out = self.w_down(hidden)
+                return self.dropout(out)
+
+        self.num_experts = num_experts
+        self.experts = nn.ModuleList(
+            [SwiGLUExpert(n_embd, hidden_dim, dropout) for _ in range(num_experts)]
+        )
+        # Router maps each token to expert logits; use top-2 gating per token.
+        self.router = nn.Linear(n_embd, num_experts, bias=False)
+        # Cache for expert load statistics (can be read externally after forward).
+        self.last_router_stats: dict[str, torch.Tensor] | None = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass.
@@ -141,11 +192,31 @@ class MLP(nn.Module):
         Returns:
             (B, T, C)
         """
-        gate = self.act(self.w_gate(x))
-        up = self.w_up(x)
-        hidden = gate * up
-        x = self.w_down(hidden)
-        return self.dropout(x)
+        # Router logits per token; top-2 routing keeps compute bounded.
+        logits = self.router(x)  # (B, T, N)
+        topk_vals, topk_idx = torch.topk(logits, k=2, dim=-1)
+        topk_weights = torch.softmax(topk_vals, dim=-1)  # (B, T, 2)
+
+        # Build a dense weight tensor per expert for straightforward mixing.
+        weights = torch.zeros_like(logits)
+        weights.scatter_(-1, topk_idx, topk_weights)
+
+        # Compute each expert output and blend with routing weights.
+        expert_outputs = [expert(x) for expert in self.experts]  # each: (B, T, C)
+        mixed = torch.zeros_like(x)
+        for idx, expert_out in enumerate(expert_outputs):
+            mixed = mixed + expert_out * weights[..., idx : idx + 1]
+
+        # Cache selection statistics for optional load monitoring (no aux loss here).
+        with torch.no_grad():
+            token_counts = weights.gt(0).sum(dim=(0, 1))
+            total_tokens = weights.shape[0] * weights.shape[1]
+            self.last_router_stats = {
+                "token_counts": token_counts,
+                "token_fraction": token_counts / max(total_tokens, 1),
+            }
+
+        return mixed
 
 
 class TransformerBlock(nn.Module):
@@ -180,10 +251,6 @@ class GPT(nn.Module):
         self.config = config
 
         self.token_emb = TokenEmbedding(config.vocab_size, config.n_embd)
-        if config.use_pos_emb:
-            self.pos_emb = nn.Embedding(config.block_size, config.n_embd)
-        else:
-            self.pos_emb = None
         self.drop = nn.Dropout(config.dropout)
 
         self.blocks = nn.ModuleList(
@@ -224,12 +291,7 @@ class GPT(nn.Module):
             raise ValueError("Sequence length exceeds block_size")
 
         token_emb = self.token_emb(x)  # (B, T, C)
-        if self.pos_emb is not None:
-            positions = torch.arange(seq_len, device=x.device)
-            pos_emb = self.pos_emb(positions)[None, :, :]  # (1, T, C)
-            x = token_emb + pos_emb
-        else:
-            x = token_emb
+        x = token_emb
         x = self.drop(x)
 
         for block in self.blocks:
@@ -251,6 +313,4 @@ class GPT(nn.Module):
         if include_embedding:
             return sum(p.numel() for p in self.parameters())
         emb_params = sum(p.numel() for p in self.token_emb.parameters())
-        if self.pos_emb is not None:
-            emb_params += sum(p.numel() for p in self.pos_emb.parameters())
         return sum(p.numel() for p in self.parameters()) - emb_params
