@@ -133,26 +133,32 @@ def main():
         weight_decay=args.weight_decay,
     )
 
-    os.makedirs(os.path.join(ROOT_DIR, "logs"), exist_ok=True)
     loss_writer = None
     loss_file = None
     if args.log_loss_csv:
-        loss_path = os.path.join(ROOT_DIR, args.log_loss_csv)
-        loss_file = open(loss_path, "w", newline="", encoding="utf-8")
+        loss_path = args.log_loss_csv
+        if not os.path.isabs(loss_path):
+            loss_path = os.path.join(ROOT_DIR, loss_path)
+        os.makedirs(os.path.dirname(loss_path), exist_ok=True)
+        file_exists = os.path.exists(loss_path)
+        loss_file = open(loss_path, "a", newline="", encoding="utf-8")
         loss_writer = csv.writer(loss_file)
-        loss_writer.writerow(["step", "loss", "lr"])
+        if not file_exists:
+            loss_writer.writerow(["step", "loss", "lr"])
 
     dataset_iter = iter(dataset)
     batch_iter = token_batcher(dataset_iter, encoding, args.batch_size, args.block_size, device)
     max_iters = args.max_steps if args.max_iters is None else args.max_iters
-    warmup_iters = min(args.warmup_iters, max_iters)
+    max_iters = max(max_iters, 1)
+    warmup_iters = max(args.warmup_iters, 0)
 
     def get_lr(step_idx: int) -> float:
         if warmup_iters > 0 and step_idx < warmup_iters:
             return args.learning_rate * (step_idx + 1) / warmup_iters
         if max_iters <= warmup_iters:
-            return args.min_lr
-        progress = (step_idx - warmup_iters) / max(1, max_iters - warmup_iters)
+            progress = 1.0
+        else:
+            progress = (step_idx - warmup_iters) / (max_iters - warmup_iters)
         progress = min(max(progress, 0.0), 1.0)
         return args.min_lr + 0.5 * (args.learning_rate - args.min_lr) * (
             1.0 + math.cos(math.pi * progress)
