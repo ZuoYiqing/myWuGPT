@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import os
 import sys
 
@@ -89,8 +90,11 @@ def main():
     parser.add_argument("--n-embd", type=int, default=256)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--min-lr", type=float, default=1e-5)
     parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--max-steps", type=int, default=200)
+    parser.add_argument("--max-iters", type=int, default=None)
+    parser.add_argument("--warmup-iters", type=int, default=200)
     parser.add_argument("--grad-accum", type=int, default=4)
     parser.add_argument("--log-interval", type=int, default=1)
     parser.add_argument("--log-loss-csv", type=str, default="logs/pretrain_loss.csv")
@@ -136,12 +140,28 @@ def main():
         loss_path = os.path.join(ROOT_DIR, args.log_loss_csv)
         loss_file = open(loss_path, "w", newline="", encoding="utf-8")
         loss_writer = csv.writer(loss_file)
-        loss_writer.writerow(["step", "loss"])
+        loss_writer.writerow(["step", "loss", "lr"])
 
     dataset_iter = iter(dataset)
     batch_iter = token_batcher(dataset_iter, encoding, args.batch_size, args.block_size, device)
+    max_iters = args.max_steps if args.max_iters is None else args.max_iters
+    warmup_iters = min(args.warmup_iters, max_iters)
+
+    def get_lr(step_idx: int) -> float:
+        if warmup_iters > 0 and step_idx < warmup_iters:
+            return args.learning_rate * (step_idx + 1) / warmup_iters
+        if max_iters <= warmup_iters:
+            return args.min_lr
+        progress = (step_idx - warmup_iters) / max(1, max_iters - warmup_iters)
+        progress = min(max(progress, 0.0), 1.0)
+        return args.min_lr + 0.5 * (args.learning_rate - args.min_lr) * (
+            1.0 + math.cos(math.pi * progress)
+        )
 
     for step in range(1, args.max_steps + 1):
+        lr = get_lr(step - 1)
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr
         optimizer.zero_grad(set_to_none=True)
         step_loss = 0.0
         for _ in range(args.grad_accum):
@@ -162,9 +182,9 @@ def main():
 
         avg_loss = step_loss / args.grad_accum
         if step % args.log_interval == 0:
-            print(f"step {step:05d} | loss {avg_loss:.6f}")
+            print(f"step {step:05d} | loss {avg_loss:.6f} | lr {lr:.6e}")
         if loss_writer is not None:
-            loss_writer.writerow([step, f"{avg_loss:.6f}"])
+            loss_writer.writerow([step, f"{avg_loss:.6f}", f"{lr:.6e}"])
 
     if loss_file is not None:
         loss_file.close()
