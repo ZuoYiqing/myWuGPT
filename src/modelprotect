@@ -1,0 +1,57 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+import dataclasses as dataclass
+
+@dataclass
+class GPTConfig:
+    vocab_size: int
+    block_size: int
+    n_layer: int
+    n_head: int
+    n_embd: int
+    dropout： float = 0.0
+
+
+class TokenEmbedding(nn.module):
+    def __init__(self, vocab_size, n_embad):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, n_embad)
+
+    def forward(self, idx):
+        return self.embedding(idx)
+
+
+class CausalSelfAttention(nn.module):
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0, "n_embd must be divisible by n_head"
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.head_dim = n_embd // n_head
+
+        self.qkv_proj = nn.Linear(n_embd, 3*n_embd)
+        self.out_proj = nn.Linear(n_embd, n_embd)
+        self.attn_dropout = nn.Dropout(config.dropout)
+
+        mask = torch.tril(torch.ones(config.block_size, config.block_size))
+        self.register_buffer("mask", mask.view(1, 1, config.block_size, config.block_size))
+    def forward(self, x):
+        B, T, C = x.shape
+        qkv = self.qkv_proj(x)  # (B, T, 3*C)
+        qkv = qkv.view(B, T, 3, self.n_head, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, n_head, T, head_dim)
+        q, k. v = qkv[0], qkv[1], qkv[2]  # each: (B, n_head, T, head_dim)
+
+        att = q @ k.transpose(-2, -1) * (1.0 / math.sqart(self.head_dim))  # (B, n_head, T, T)
+        att = att.masked_fill(self.mask[:, :, :T, :T], float("-inf"))
+        att = torch.softmax(att, dim=-1)
+        att = self.attn_dropout(att)
+        y = att @ v # (B, n_head, T, head_dim)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)  # (B, T, C)
+        y = self.out_proj(y)
+        return y
+
+class MLP(nn.module):
+    

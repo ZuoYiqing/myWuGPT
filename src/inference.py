@@ -59,7 +59,15 @@ def generate(model, idx, max_new_tokens, temperature=1.0, top_k=None):
 
 
 def load_checkpoint(path, device):
-    checkpoint = torch.load(path, map_location=device)
+    # Use safe_globals to allowlist local classes (e.g., GPTConfig) when loading
+    try:
+        from torch.serialization import safe_globals
+        with safe_globals([model_module.GPTConfig]):
+            checkpoint = torch.load(path, map_location=device, weights_only=False)
+    except Exception:
+        # Fallback (less safe) to standard load
+        checkpoint = torch.load(path, map_location=device)
+
     config = checkpoint.get("config")
     if config is None:
         raise ValueError("Checkpoint missing config")
@@ -70,6 +78,41 @@ def load_checkpoint(path, device):
     return model, tokenizer_info
 
 
+def inject_references(prompt: str, reference_block: str) -> str:
+    marker = "### Assistant"
+    idx = prompt.find(marker)
+    if idx == -1:
+        return prompt + reference_block
+    return prompt[:idx] + reference_block + prompt[idx:]
+
+
+def format_source_meta(meta: dict) -> tuple[str, str]:
+    source = meta.get("source_file", "unknown")
+    page = (
+        meta.get("page")
+        or meta.get("paragraph")
+        or meta.get("page_or_para")
+        or meta.get("para")
+        or "n/a"
+    )
+    return source, str(page)
+
+
+def build_reference_block(chunks) -> str:
+    if not chunks:
+        return ""
+    lines = ["\n\n### Reference Materials"]
+    for idx, chunk in enumerate(chunks, 1):
+        meta = chunk.get("metadata", {})
+        source, page = format_source_meta(meta)
+        header = f"[source: {source} | page: {page}]"
+        lines.append(header)
+        lines.append(chunk.get("text", "").strip())
+        lines.append("")
+    lines.append("### End Reference Materials\n\n")
+    return "\n".join(lines)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Minimal GPT inference")
     parser.add_argument("--prompt", type=str, default="Hello", help="Input prompt text")
@@ -77,6 +120,10 @@ def main():
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--use-rag", type=int, default=0, choices=[0, 1])
+    parser.add_argument("--kb-dir", type=str, default="knowledge_base")
+    parser.add_argument("--rag-top-k", type=int, default=4)
+    parser.add_argument("--rag-persist-dir", type=str, default=".chroma")
     parser.add_argument(
         "--checkpoint",
         type=str,
@@ -90,6 +137,14 @@ def main():
     encode_prompt, decode_tokens = get_tokenizer(tokenizer_info)
 
     prompt = args.prompt
+    chunks = []
+    if args.use_rag == 1:
+        from src import rag as rag_module  # noqa: E402
+
+        chunks = rag_module.retrieve(prompt, args.rag_persist_dir, args.rag_top_k)
+        reference_block = build_reference_block(chunks)
+        if reference_block:
+            prompt = inject_references(prompt, reference_block)
     token_ids = encode_prompt(prompt)
     if not token_ids:
         token_ids = [0]
@@ -103,6 +158,13 @@ def main():
         top_k=args.top_k,
     )
     output_text = decode_tokens(out[0].tolist())
+    if args.use_rag == 1 and chunks:
+        source_lines = ["", "Sources:"]
+        for item in chunks:
+            meta = item.get("metadata", {})
+            source, page = format_source_meta(meta)
+            source_lines.append(f"- {source} | page: {page}")
+        output_text = output_text.rstrip() + "\n" + "\n".join(source_lines)
     print(output_text)
 
 

@@ -101,7 +101,14 @@ def main():
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--download-only", action="store_true")
+    parser.add_argument("--ckpt-path", type=str, default=None, help="Path to checkpoint to load (default weights/pretrain.pt)")
+    parser.add_argument("--resume", action="store_true", help="Resume training from checkpoint at --ckpt-path")
+    parser.add_argument("--resume-step", type=int, default=None, help="If checkpoint lacks 'step', set starting step to this value")
     args = parser.parse_args()
+
+    # Resolve default checkpoint path if not provided
+    if args.ckpt_path is None:
+        args.ckpt_path = os.path.join(ROOT_DIR, "weights", "pretrain.pt")
 
     torch.manual_seed(args.seed)
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -133,6 +140,34 @@ def main():
         weight_decay=args.weight_decay,
     )
 
+    # Resume from checkpoint if requested
+    start_step = 0
+    if args.resume:
+        ckpt_path = args.ckpt_path
+        if not os.path.isabs(ckpt_path):
+            ckpt_path = os.path.join(ROOT_DIR, ckpt_path)
+        if os.path.exists(ckpt_path):
+            # Use safe_globals to allowlist local classes when loading checkpoints
+            try:
+                from torch.serialization import safe_globals
+                with safe_globals([model_module.GPTConfig]):
+                    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+            except Exception:
+                # Fallback to regular load (less safe) if safe_globals is unavailable
+                ckpt = torch.load(ckpt_path, map_location=device)
+            model.load_state_dict(ckpt["model_state_dict"])
+            if "optimizer_state_dict" in ckpt:
+                try:
+                    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                except Exception as e:
+                    print(f"Warning: failed to load optimizer state: {e}")
+            start_step = ckpt.get("step", 0)
+            if args.resume_step is not None:
+                start_step = max(start_step, args.resume_step)
+            print(f"Resumed from checkpoint {ckpt_path} at step {start_step}")
+        else:
+            print(f"Warning: resume requested but checkpoint not found at {ckpt_path}. Starting from scratch.")
+
     loss_writer = None
     loss_file = None
     if args.log_loss_csv:
@@ -141,6 +176,7 @@ def main():
             loss_path = os.path.join(ROOT_DIR, loss_path)
         os.makedirs(os.path.dirname(loss_path), exist_ok=True)
         file_exists = os.path.exists(loss_path)
+        # open in append mode so we can resume logging
         loss_file = open(loss_path, "a", newline="", encoding="utf-8")
         loss_writer = csv.writer(loss_file)
         if not file_exists:
@@ -164,7 +200,8 @@ def main():
             1.0 + math.cos(math.pi * progress)
         )
 
-    for step in range(1, args.max_steps + 1):
+    # iterate from the next step after start_step up to max_iters
+    for step in range(start_step + 1, max_iters + 1):
         lr = get_lr(step - 1)
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
@@ -196,7 +233,7 @@ def main():
         loss_file.close()
 
     os.makedirs(os.path.join(ROOT_DIR, "weights"), exist_ok=True)
-    ckpt_path = os.path.join(ROOT_DIR, "weights", "pretrain.pt")
+    ckpt_path = args.ckpt_path if getattr(args, "ckpt_path", None) else os.path.join(ROOT_DIR, "weights", "pretrain.pt")
     torch.save(
         {
             "model_state_dict": model.state_dict(),
@@ -208,6 +245,7 @@ def main():
                 "eot_token": encoding.eot_token,
             },
             "train_args": vars(args),
+            "step": step,
         },
         ckpt_path,
     )

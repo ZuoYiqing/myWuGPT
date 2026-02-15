@@ -31,15 +31,28 @@ def load_checkpoint(path: str, device: torch.device):
     model = build_model(config)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
-    return model
+    tokenizer_info = checkpoint.get("tokenizer")
+    return model, tokenizer_info
 
 
-def encode_prompt(prompt: str) -> list[int]:
-    return list(prompt.encode("utf-8"))
-
-
-def decode_tokens(tokens: list[int]) -> str:
-    return bytes(tokens).decode("utf-8", errors="replace")
+def get_tokenizer(tokenizer_info: dict | None):
+    if not tokenizer_info:
+        return (
+            lambda prompt: list(prompt.encode("utf-8")),
+            None,
+        )
+    try:
+        import tiktoken
+    except ImportError as exc:
+        raise RuntimeError(
+            "tiktoken is required to use this checkpoint. Install with `pip install tiktoken`."
+        ) from exc
+    encoding_name = tokenizer_info.get("encoding", "gpt2")
+    encoding = tiktoken.get_encoding(encoding_name)
+    return (
+        lambda prompt: encoding.encode(prompt),
+        lambda tokens: encoding.decode(tokens),
+    )
 
 
 def generate(model, idx, max_new_tokens):
@@ -77,19 +90,54 @@ def main():
         default=os.path.join(ROOT_DIR, "weights", "quantized_model.pt"),
     )
     parser.add_argument("--prompt", type=str, default="Once upon a time")
+    parser.add_argument(
+        "--weights-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save only quantized weights (default).",
+    )
+    parser.add_argument(
+        "--quantize-embedding",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Quantize nn.Embedding weights when supported (default).",
+    )
     args = parser.parse_args()
 
     device = torch.device("cpu")
-    model = load_checkpoint(args.checkpoint, device)
+    model, tokenizer_info = load_checkpoint(args.checkpoint, device)
+    encode_prompt, decode_tokens = get_tokenizer(tokenizer_info)
 
     original_size = os.path.getsize(args.checkpoint)
 
+    qconfig_spec = {nn.Linear: torch.quantization.default_dynamic_qconfig}
+    if args.quantize_embedding:
+        embedding_qconfig = getattr(
+            torch.quantization, "float_qparams_weight_only_qconfig", None
+        )
+        if embedding_qconfig is None:
+            print("Warning: embedding quantization not supported by this PyTorch build.")
+        else:
+            qconfig_spec[nn.Embedding] = embedding_qconfig
+
     quantized_model = torch.quantization.quantize_dynamic(
-        model, {nn.Linear}, dtype=torch.qint8
+        model, qconfig_spec=qconfig_spec, dtype=torch.qint8
     )
 
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
-    torch.save({"model_state_dict": quantized_model.state_dict(), "config": model.config}, args.output)
+    if args.weights_only:
+        save_obj = {
+            "model": quantized_model.state_dict(),
+            "meta": {"quantized": "dynamic_int8"},
+        }
+    else:
+        save_obj = {
+            "model_state_dict": quantized_model.state_dict(),
+            "config": model.config,
+            "tokenizer": tokenizer_info,
+            "meta": {"quantized": "dynamic_int8"},
+        }
+    torch.save(save_obj, args.output)
     quantized_size = os.path.getsize(args.output)
 
     print(
@@ -105,9 +153,13 @@ def main():
     start = time.perf_counter()
     out = generate(quantized_model, idx, max_new_tokens=32)
     elapsed = time.perf_counter() - start
-    text = decode_tokens(out[0].tolist())
-    print("sample:", text)
+    if decode_tokens is None:
+        print("sample tokens:", out[0].tolist())
+    else:
+        text = decode_tokens(out[0].tolist())
+        print("sample:", text)
     print(f"latency: {elapsed:.4f}s (CPU)")
+    print(f"output_size_mb={quantized_size / (1024 * 1024):.2f}")
 
 
 if __name__ == "__main__":

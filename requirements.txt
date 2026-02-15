@@ -1,0 +1,15 @@
+torch
+tiktoken
+datasets
+sentence-transformers
+chromadb
+PyPDF2
+python-docx
+ebooklib
+beautifulsoup4
+pandas
+openpyxl
+matplotlib
+numpy
+onnx
+pycryptodome
