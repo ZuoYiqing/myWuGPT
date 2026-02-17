@@ -1,4 +1,9 @@
-# ===== generated / large =====
+# env
+.venv/
+__pycache__/
+*.pyc
+
+# local outputs / data
 weights/
 data/
 logs/
@@ -6,20 +11,15 @@ out/
 kb/
 knowledge_base/
 .chroma/
-__pycache__/
+assets/model.onnx
+assets/*.pt
 *.pt
-*.pth
-*.onnx
-
-# optional: datasets / caches
-*.parquet
 *.bin
-*.zip
-*.tar
-*.tar.gz
-*.7z
 *.ckpt
+*.onnx
+*.pdf
+*.epub
 
-# OS / IDE
-.vscode/
+# OS
 .DS_Store
+Thumbs.db
