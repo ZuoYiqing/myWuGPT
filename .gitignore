@@ -1,0 +1,25 @@
+# ===== generated / large =====
+weights/
+data/
+logs/
+out/
+kb/
+knowledge_base/
+.chroma/
+__pycache__/
+*.pt
+*.pth
+*.onnx
+
+# optional: datasets / caches
+*.parquet
+*.bin
+*.zip
+*.tar
+*.tar.gz
+*.7z
+*.ckpt
+
+# OS / IDE
+.vscode/
+.DS_Store
